@@ -20,3 +20,8 @@ htmlcov/
 .DS_Store
 Thumbs.db
 *.log
+
+# Generated artifacts
+sample.pdf
+*.csv
+

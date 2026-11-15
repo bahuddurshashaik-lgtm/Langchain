@@ -34,11 +34,7 @@ def _status(marker: str, label: str, detail: str = "") -> None:
 
 def check_key_format(key: str) -> bool:
     """Accept both classic keys (AIza..., 39 chars) and the newer AQ. format."""
-    if key.startswith("AIza") and len(key) == 39:
-        return True
-    if key.startswith("AQ.") and len(key) >= 20:
-        return True
-    return False
+    return (key.startswith("AIza") and len(key) == 39) or (key.startswith("AQ.") and len(key) >= 20)
 
 
 def list_models(key: str) -> list[str]:
@@ -97,13 +93,19 @@ def main() -> int:
         models = list_models(key)
     except Exception as exc:  # noqa: BLE001
         message = str(exc)
-        hint = "key rejected" if ("401" in message or "403" in message or "API key" in message) else "request failed"
+        rejected = any(token in message for token in ("401", "403", "API key"))
+        hint = "key rejected" if rejected else "request failed"
         _status(FAIL, "model listing", f"{hint}: {message[:160]}")
         return 2
 
     _status(OK, "model listing", f"{len(models)} models visible to this key")
     for wanted in ("gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-2.5-flash"):
-        _status(OK if wanted in models else WARN, f"model available: {wanted}", "" if wanted in models else "not listed")
+        available = wanted in models
+        _status(
+            OK if available else WARN,
+            f"model available: {wanted}",
+            "" if available else "not listed",
+        )
 
     print("\n-- generation through LangChain --")
     configured = (os.getenv("GEMINI_MODEL") or "gemini-3.1-flash-lite").strip()
