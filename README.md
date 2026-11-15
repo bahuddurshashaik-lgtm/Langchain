@@ -1,5 +1,7 @@
 # 📄 PDF AI Summarizer
 
+[![CI](https://github.com/bahuddurshashaik-lgtm/Langchain/actions/workflows/ci.yml/badge.svg)](https://github.com/bahuddurshashaik-lgtm/Langchain/actions/workflows/ci.yml)
+
 A Streamlit app that summarizes PDF documents with **Google Gemini** via **LangChain**. Upload a PDF, pick a summary style, and get a map-reduce summary, a structure analysis and optional key quotes — then export everything.
 
 Built end to end across six phases: credential validation → PDF pipeline → LLM chains → UI → hardening → CI.
@@ -113,6 +115,25 @@ ruff check .    # lint
 ```
 
 Tests cover cleaning, chunk boundaries, content preservation, corrupt/blank PDFs, message parsing, per-chunk failure isolation, retry behaviour, export formatting and a headless Streamlit smoke test.
+
+CI (`.github/workflows/ci.yml`) runs lint and the full suite on Python 3.11 and 3.12 for every push and pull request. A separate `live-check` job verifies the real Gemini key, but only on `main` and only when the `GEMINI_API_KEY` repository secret exists — it is skipped instead of failing when the secret is absent, and never runs for pull requests.
+
+## Deploy
+
+Streamlit Community Cloud:
+
+1. Push this repository to GitHub.
+2. Sign in at [share.streamlit.io](https://share.streamlit.io) and choose **New app**.
+3. Select the repo, branch `main` and file `app.py`.
+4. Under **Advanced settings → Secrets**, add:
+
+   ```toml
+   GEMINI_API_KEY = "your-key-here"
+   GEMINI_MODEL = "gemini-3.1-flash-lite"
+   ```
+
+   The app reads `GEMINI_API_KEY` from the environment first, then falls back to `st.secrets`.
+5. Deploy. Never commit `.env` — it is git-ignored, and the key belongs in secrets.
 
 ## Troubleshooting
 
