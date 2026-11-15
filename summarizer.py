@@ -20,6 +20,30 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "gemini-3.1-flash-lite"
 MAX_CONCURRENCY = 4
+DEFAULT_RETRIES = 3
+DEFAULT_RETRY_DELAY = 1.0
+
+TRANSIENT_MARKERS = (
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "rate limit",
+    "quota",
+    "resource exhausted",
+    "overloaded",
+    "unavailable",
+    "deadline",
+    "timeout",
+    "temporarily",
+)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True for errors worth retrying: rate limits, quota, 5xx and timeouts."""
+    message = str(exc).lower()
+    return any(marker in message for marker in TRANSIENT_MARKERS)
 
 
 def _message_text(message: Any) -> str:
@@ -51,8 +75,16 @@ def _message_text(message: Any) -> str:
 class PDFSummarizer:
     """Wraps the Gemini model in the four chains the app needs."""
 
-    def __init__(self, model: str | None = None, llm: Any | None = None):
+    def __init__(
+        self,
+        model: str | None = None,
+        llm: Any | None = None,
+        max_retries: int = DEFAULT_RETRIES,
+        retry_delay: float = DEFAULT_RETRY_DELAY,
+    ):
         self.model = (model or os.getenv("GEMINI_MODEL") or DEFAULT_MODEL).strip()
+        self.max_retries = max(0, max_retries)
+        self.retry_delay = max(0.0, retry_delay)
 
         if llm is not None:
             self.llm = llm
@@ -73,17 +105,75 @@ class PDFSummarizer:
         self.analysis_chain = ANALYSIS | self.llm | parser
         self.quotes_chain = QUOTES | self.llm | parser
 
+    # -- retry plumbing ---------------------------------------------------
+
+    def _invoke(self, chain, payload: dict) -> str:
+        """Invoke a chain, retrying transient errors with exponential backoff."""
+        last: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                return chain.invoke(payload)
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                if not _is_transient(exc) or attempt >= self.max_retries:
+                    raise
+                delay = self.retry_delay * (2**attempt)
+                logger.warning(
+                    "Transient error, retry %d/%d in %.1fs: %s",
+                    attempt + 1,
+                    self.max_retries,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+        raise last  # pragma: no cover - loop always returns or raises
+
+    def _batch(self, inputs: list[dict]) -> list:
+        """Batch-invoke the chunk chain, retrying only the chunks that failed transiently."""
+        results: list = [None] * len(inputs)
+        pending = list(range(len(inputs)))
+        attempt = 0
+
+        while pending:
+            batch_results = self.chunk_chain.batch(
+                [inputs[i] for i in pending],
+                config={"max_concurrency": MAX_CONCURRENCY},
+                return_exceptions=True,
+            )
+            retry: list[int] = []
+            for index, result in zip(pending, batch_results, strict=False):
+                retryable = (
+                    isinstance(result, Exception)
+                    and _is_transient(result)
+                    and attempt < self.max_retries
+                )
+                if retryable:
+                    retry.append(index)
+                else:
+                    results[index] = result
+
+            pending = retry
+            if pending:
+                delay = self.retry_delay * (2**attempt)
+                logger.warning(
+                    "Retrying %d chunk(s) in %.1fs after transient failure", len(pending), delay
+                )
+                time.sleep(delay)
+                attempt += 1
+
+        return results
+
     # -- single calls -----------------------------------------------------
 
     def summarize_text(self, text: str, summary_type: str = "detailed") -> str:
         """Summarize one piece of text in the requested style."""
         style = STYLES.get(summary_type, STYLES["detailed"])
-        return self.chunk_chain.invoke({"style": style, "text": text})
+        return self._invoke(self.chunk_chain, {"style": style, "text": text})
 
     def analyze_document_structure(self, text: str) -> dict:
         """Describe the document layout; failures are reported, never raised."""
         try:
-            analysis = self.analysis_chain.invoke({"text": text[:3000]})
+            analysis = self._invoke(self.analysis_chain, {"text": text[:3000]})
             return {"analysis": analysis, "status": "success"}
         except Exception as exc:  # noqa: BLE001
             logger.warning("Structure analysis failed: %s", exc)
@@ -91,7 +181,7 @@ class PDFSummarizer:
 
     def extract_key_quotes(self, text: str) -> list[str]:
         """Return up to 10 verbatim quotes, with list markers and quotes stripped."""
-        response = self.quotes_chain.invoke({"text": text})
+        response = self._invoke(self.quotes_chain, {"text": text})
         lines = (
             re.sub(r"^\s*(\d+[.)]|[-*•])\s*", "", line).strip(' "“”')
             for line in response.splitlines()
@@ -115,9 +205,7 @@ class PDFSummarizer:
         inputs = [{"style": style, "text": chunk} for chunk in chunks]
 
         started = time.perf_counter()
-        results = self.chunk_chain.batch(
-            inputs, config={"max_concurrency": MAX_CONCURRENCY}, return_exceptions=True
-        )
+        results = self._batch(inputs)
         elapsed = time.perf_counter() - started
 
         summaries = []
@@ -159,7 +247,7 @@ class PDFSummarizer:
         sections = "\n\n".join(f"Section {i}: {s}" for i, s in enumerate(valid, start=1))
         style = STYLES.get(summary_type, STYLES["detailed"])
         try:
-            return self.combine_chain.invoke({"style": style, "summaries": sections})
+            return self._invoke(self.combine_chain, {"style": style, "summaries": sections})
         except Exception as exc:  # noqa: BLE001
             logger.warning("Combine step failed, returning concatenation: %s", exc)
             return f"Combined Summary:\n\n{sections}"
